@@ -16,6 +16,11 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+dependencies = [
+    "google-genai",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -24,7 +29,14 @@ dev = [
     "pre-commit",
 ]
 
+[project.scripts]
+generate-illustrations = "illustration_generator.generate_illustrations:main"
+compose-challenge-post = "illustration_generator.compose_challenge_post:main"
+generate-preview-post = "illustration_generator.generate_preview_post:main"
 
 [project.urls]
 "Homepage" = "https://github.com/OpenPecha/openpecha-project-template"
 "Bug Tracker" = "https://github.com/OpenPecha/openpecha-project-template/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
