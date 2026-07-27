@@ -20,6 +20,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from .image_utils import save_png_under_limit
+
 FONTS_DIR = Path(__file__).parent / "fonts"
 BACKGROUND_PATH = Path(__file__).parent / "data" / "background.png"
 HANDLE = "@WeBuddhist"
@@ -409,9 +411,7 @@ def compose_challenge(
     handle_y = canvas.height - BOTTOM_MARGIN - SIZE_HANDLE
     draw.text((MARGIN_X, handle_y), HANDLE, font=font_handle, fill=COLOR_PRIMARY)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.convert("RGB").save(output_path, "PNG")
-    return output_path
+    return save_png_under_limit(canvas.convert("RGB"), output_path)
 
 
 def resolve_inputs(

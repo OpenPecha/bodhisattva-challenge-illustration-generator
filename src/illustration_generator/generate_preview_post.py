@@ -27,6 +27,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from .compose_challenge_post import find_illustration, parse_date_from_filename
+from .image_utils import save_jpeg_under_limit
 
 FONTS_DIR = Path(__file__).parent / "fonts"
 
@@ -279,9 +280,7 @@ def generate_day_image(
     illustration_y = CANVAS_SIZE[1] - BOTTOM_MARGIN - illustration.height
     canvas.paste(illustration, (illustration_x, illustration_y), illustration)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path, quality=95)
-    return output_path
+    return save_jpeg_under_limit(canvas, output_path)
 
 
 def compare_with_reference(generated_path: Path, reference_path: Path) -> float:

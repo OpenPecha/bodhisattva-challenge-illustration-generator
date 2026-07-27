@@ -28,6 +28,8 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
+from .image_utils import save_png_under_limit
+
 FONTS_DIR = Path(__file__).parent / "fonts"
 
 HANDLE = "@WeBuddhist"
@@ -563,9 +565,7 @@ def compose_language_image(post: LanguagePost, title_parts: dict[str, str], illo
     handle_y = height - BOTTOM_MARGIN - SIZE_HANDLE
     draw.text((left, handle_y), HANDLE, font=fonts.handle, fill=COLOR_HANDLE)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path, "PNG")
-    return output_path
+    return save_png_under_limit(canvas, output_path)
 
 
 def find_illustration(illustration_arg: Path, day: int) -> Path:
@@ -584,6 +584,12 @@ def find_illustration(illustration_arg: Path, day: int) -> Path:
     raise FileNotFoundError(f"Illustration path not found: {illustration_arg}")
 
 
+def save_compressed_illustration(illo_path: Path, output_dir: Path, day: int) -> Path:
+    """Save a copy of the raw illustration under ``output_dir/illustration/`` under 1MB."""
+    out = output_dir / "illustration" / f"day{day}.png"
+    return save_png_under_limit(Image.open(illo_path), out)
+
+
 def compose_all(md_path: Path, illustration_arg: Path, output_dir: Path) -> list[Path]:
     """Generate one image per language, each in its own language subfolder."""
     day = parse_day_number(md_path)
@@ -591,7 +597,7 @@ def compose_all(md_path: Path, illustration_arg: Path, output_dir: Path) -> list
     title_parts = parse_release_date(md_path)
     illo_path = find_illustration(illustration_arg, day)
 
-    outputs: list[Path] = []
+    outputs: list[Path] = [save_compressed_illustration(illo_path, output_dir, day)]
     for post in posts:
         out = output_dir / post.script / f"day{day}.png"
         outputs.append(compose_language_image(post, title_parts, illo_path, out))
