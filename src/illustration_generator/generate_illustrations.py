@@ -1,12 +1,15 @@
 """Batch illustration generator using Gemini 3 Pro Image.
 
-Parses a single Verse_and_challenge.md file, splits it by verse headings,
-extracts verse/practice/explanation, and submits a batch image generation
-job. Generates three illustrations per verse — one from the verse alone, one
-from the practice + explanation, and one from all three combined — and saves
-them into individual folders.
+Parses a folder of ``day_NN_sharable_image_text.md`` files (each carrying the
+verse of the day in English, Tibetan, and Hindi), pulls in the matching daily
+"challenge" (practice + explanation) from the Tibetan and English day-plan
+files, and submits a batch image generation job with one combined prompt per
+day. Generates exactly one illustration per day and saves it with a
+transparent background as ``data/illustrations/Day<N>-ch<C>.png``.
 """
 
+import argparse
+import io
 import os
 import re
 import sys
@@ -18,12 +21,22 @@ import numpy as np
 from PIL import Image
 from google import genai
 
-TIBETAN_DIGITS = {
-    "༠": 0, "༡": 1, "༢": 2, "༣": 3, "༤": 4,
-    "༥": 5, "༦": 6, "༧": 7, "༨": 8, "༩": 9,
-}
+from .image_utils import save_png_under_limit
 
-IMAGES_PER_VERSE = 3
+# Default locations of the source vault folders. Overridable via environment
+# variables so this script can run on other machines/checkouts.
+DALAI_LAMA_PLANS_DIR = Path(os.environ.get(
+    "DALAI_LAMA_PLANS_DIR",
+    "/Users/tenkal/webuddhist/obsidian/bodhisattvacharyavatara-rails/"
+    "3-TRANSFORMATIONS/Plans/Dalai Lama",
+))
+EN_CHALLENGE_DAYS_DIR = Path(os.environ.get(
+    "EN_CHALLENGE_DAYS_DIR",
+    "/Users/tenkal/webuddhist/obsidian/bodhisattvacharyavatara-rails/"
+    "3-TRANSFORMATIONS/Plans/the-bodhisattva-challenge/en/Days",
+))
+
+OUTPUT_DIR = Path(__file__).parent / "data" / "illustrations"
 
 _STYLE_BLOCK = """\
 The line drawing illustration should be a Anand Pai comic illustration combined with features of "Madhubani art style".
@@ -50,42 +63,6 @@ village life.
 - The illustration shouldn't be in a square box. The image panel shouldn't have side borders.
 """
 
-VERSE_PROMPT_TEMPLATE = f"""\
-Let's illustrate a scene for a buddhist verse.
-
-Generate exactly one single illustration. Do NOT create multiple scenes or a \
-collage — just one clean image.
-
-{_RULES_BLOCK}
-
-Here's the verse to illustrate:
-
-{{verse}}
-
-Identify the main character(s) of the scene, and the action happening in the scene. \
-Illustrate the main action and feeling evoked by the verse itself. 
-
-{_STYLE_BLOCK}
-"""
-
-PRACTICE_PROMPT_TEMPLATE = f"""\
-Let's illustrate a scene for a buddhist daily practice.
-
-Generate exactly one single illustration. Do NOT create multiple scenes or a \
-collage — just one clean image.
-
-{_RULES_BLOCK}
-
-Here's the practice and its explanation:
-
-Practice: {{practice}}
-
-Identify the main character(s) of the scene, and the action happening in the scene. \
-The illustration should trigger the viewer to remember and perform the practice.
-
-{_STYLE_BLOCK}
-"""
-
 COMBINED_PROMPT_TEMPLATE = f"""\
 Let's illustrate a scene for a buddhist text.
 
@@ -94,11 +71,22 @@ collage — just one clean image.
 
 {_RULES_BLOCK}
 
-Here's the text to illustrate:
+Here is today's verse. The Tibetan is the primary text; the English and Hindi \
+translations are given only so you can better understand its meaning:
 
-Verse: {{verse}}; Practice: {{practice}}; Explanation: {{explanation}}
+Tibetan verse (primary): {{verse_bo}}
+English translation (context only): {{verse_en}}
+Hindi translation (context only): {{verse_hi}}
 
-Pick a common theme to the above texts to illustrate. \
+Here is today's practice ("challenge") that goes with the verse, given in \
+Tibetan and English for context:
+
+Tibetan practice: {{practice_bo}}
+Tibetan explanation: {{explanation_bo}}
+English practice: {{practice_en}}
+English explanation: {{explanation_en}}
+
+Pick a common theme uniting the verse and the practice above. \
 Identify the main character(s) of the scene, and the action happening in the scene. \
 The illustration should trigger the main feeling of the theme.
 
@@ -116,92 +104,204 @@ COMPLETED_STATES = {
 
 
 @dataclass
-class VerseEntry:
-    """Parsed content from one verse section of the markdown."""
+class DayVerse:
+    """The verse of the day, parsed from a sharable-image markdown file."""
 
-    number: int
-    verse: str
-    practice: str
-    explanation: str
-
-
-def parse_tibetan_number(raw: str) -> int:
-    """Convert Tibetan numeral string (e.g. ༡༤) to an integer."""
-    digits = [str(TIBETAN_DIGITS[ch]) for ch in raw if ch in TIBETAN_DIGITS]
-    if not digits:
-        raise ValueError(f"No Tibetan digits found in: {raw!r}")
-    return int("".join(digits))
+    day: int
+    chapter: int
+    verse: int
+    verse_bo: str
+    verse_en: str
+    verse_hi: str
 
 
-def parse_verses(md_path: Path) -> list[VerseEntry]:
-    """Split the markdown by verse headings and extract fields."""
+@dataclass
+class DayChallenge:
+    """The challenge (practice + explanation) matched to a day's verse."""
+
+    practice_bo: str
+    explanation_bo: str
+    practice_en: str
+    explanation_en: str
+
+
+def parse_day_number(md_path: Path) -> int:
+    """Extract the day number from a filename like ``day_27_...md``."""
+    match = re.search(r"day[_-]?(\d{1,3})", md_path.name, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Could not find a day number in filename: {md_path.name}")
+    return int(match.group(1))
+
+
+def _detect_script(heading: str) -> str:
+    lower = heading.strip().lower()
+    if lower.startswith("english"):
+        return "english"
+    if lower.startswith("tibetan"):
+        return "tibetan"
+    if lower.startswith("hindi"):
+        return "hindi"
+    return ""
+
+
+def _extract_bold_field(text: str, *labels: str) -> str:
+    """Extract the text following a ``**label...**`` marker, up to the next ``**``.
+
+    Trailing punctuation inside the bold marker (e.g. ``**ཚིགས་བཅད།**`` or
+    ``**आज का श्लोक:**``) is tolerated between the label and the closing ``**``.
+    """
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    pattern = rf"\*\*\s*(?:{label_pattern})[^\n*]*\*\*[:\s]*\n?(.+?)(?=\n\*\*|\Z)"
+    match = re.search(pattern, text, re.DOTALL)
+    return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+
+
+def parse_sharable_image_md(md_path: Path) -> DayVerse:
+    """Parse the verse of the day (English/Tibetan/Hindi) from one day file."""
+    text = md_path.read_text(encoding="utf-8")
+    day = parse_day_number(md_path)
+
+    sections: dict[str, str] = {}
+    for heading, body in re.findall(r"(?m)^##\s+(.+?)\s*$\n(.*?)(?=\n##\s|\Z)", text, re.DOTALL):
+        script = _detect_script(heading)
+        if script:
+            sections[script] = body.split("\n---", 1)[0]
+
+    missing_langs = [lang for lang in ("english", "tibetan", "hindi") if lang not in sections]
+    if missing_langs:
+        raise ValueError(f"{md_path.name}: missing language section(s): {', '.join(missing_langs)}")
+
+    verse_en = _extract_bold_field(sections["english"], "Verse of the day", "Verse of day")
+    verse_bo = _extract_bold_field(sections["tibetan"], "ཚིགས་བཅད")
+    verse_hi = _extract_bold_field(sections["hindi"], "आज का श्लोक")
+
+    verse_id_raw = _extract_bold_field(sections["english"], "Verse id", "Verse ID")
+    id_match = re.search(r"\^(\d+)-(\d+)", verse_id_raw)
+    if not id_match:
+        raise ValueError(f"{md_path.name}: could not find a chapter-verse id (e.g. ^2-30) in {verse_id_raw!r}")
+    chapter, verse = int(id_match.group(1)), int(id_match.group(2))
+
+    if not verse_en or not verse_bo or not verse_hi:
+        raise ValueError(f"{md_path.name}: could not parse verse text in all three languages")
+
+    return DayVerse(
+        day=day, chapter=chapter, verse=verse,
+        verse_bo=verse_bo, verse_en=verse_en, verse_hi=verse_hi,
+    )
+
+
+def _find_chapter_dir(base_dir: Path, chapter: int) -> Path:
+    """Find the ``Chapter-<N> ...`` subfolder for a given chapter number."""
+    pattern = re.compile(rf"^Chapter-{chapter}\b", re.IGNORECASE)
+    matches = [p for p in base_dir.iterdir() if p.is_dir() and pattern.match(p.name)]
+    if not matches:
+        raise FileNotFoundError(f"No 'Chapter-{chapter}' folder found under {base_dir}")
+    return matches[0]
+
+
+def _extract_heading_block(text: str, needle: str, level: str = "###") -> str:
+    """Extract the body under a heading (at ``level``) whose text contains ``needle``."""
+    pattern = rf"(?m)^{level}[^\n]*{re.escape(needle)}[^\n]*\n(.*?)(?=\n{level}[^#]|\Z)"
+    match = re.search(pattern, text, re.DOTALL)
+    return match.group(1) if match else ""
+
+
+def find_tibetan_day_plan(day: int, chapter: int) -> Path:
+    """Locate the Tibetan (Dalai Lama) day-plan file for ``day``/``chapter``."""
+    chapter_dir = _find_chapter_dir(DALAI_LAMA_PLANS_DIR, chapter)
+    pattern = re.compile(rf"^Day-{day}-Ch{chapter}-V[\d-]+\.md$", re.IGNORECASE)
+    matches = [p for p in chapter_dir.iterdir() if p.is_file() and pattern.match(p.name)]
+    if not matches:
+        raise FileNotFoundError(f"No Tibetan day-plan file for day {day} (chapter {chapter}) in {chapter_dir}")
+    return matches[0]
+
+
+def find_english_day_plan(day: int, chapter: int) -> Path:
+    """Locate the English day-plan file for ``day``/``chapter``."""
+    chapter_dir = _find_chapter_dir(EN_CHALLENGE_DAYS_DIR, chapter)
+    pattern = re.compile(rf"^{day}-ch{chapter}-v[\d-]+-eng\.md$", re.IGNORECASE)
+    matches = [p for p in chapter_dir.iterdir() if p.is_file() and pattern.match(p.name)]
+    if not matches:
+        raise FileNotFoundError(f"No English day-plan file for day {day} (chapter {chapter}) in {chapter_dir}")
+    return matches[0]
+
+
+def _extract_field(text: str, needle: str) -> str:
+    """Extract a field that may appear either as a ``#### needle`` heading or
+    as an inline ``**needle**`` bold marker (both conventions occur in the
+    Tibetan day-plan files).
+    """
+    heading_value = _extract_heading_block(text, needle, level="####").strip()
+    if heading_value:
+        return heading_value
+    return _extract_bold_field(text, needle)
+
+
+def parse_tibetan_day_plan(md_path: Path, expected_chapter: int, expected_verse: int) -> tuple[str, str]:
+    """Extract the Tibetan practice + explanation for today from a day-plan file."""
     text = md_path.read_text(encoding="utf-8")
 
-    heading_pattern = r"###\s*ཚིགས་བཅད་\s+([༠-༩]+)\s*།"
-    headings = list(re.finditer(heading_pattern, text))
+    section = _extract_heading_block(text, "དེ་རིང་གི་ཉམས་ལེན")
+    if not section:
+        raise ValueError(f"{md_path.name}: could not find the 'today's practice' section")
 
-    if not headings:
-        raise ValueError("No verse headings found in the markdown file")
+    practice_bo = _extract_field(section, "ཉམས་ལེན་དངོས")
+    explanation_bo = _extract_field(section, "འགྲེལ་བཤད")
+    image_verse_block = _extract_field(section, "པར་གྱི་ཚིགས་བཅད")
 
-    entries: list[VerseEntry] = []
+    if not practice_bo or not explanation_bo:
+        raise ValueError(f"{md_path.name}: could not parse Tibetan practice/explanation")
 
-    for idx, match in enumerate(headings):
-        num = parse_tibetan_number(match.group(1))
-        start = match.end()
-        end = headings[idx + 1].start() if idx + 1 < len(headings) else len(text)
-        section = text[start:end]
+    id_match = re.search(r"\^(\d+)-(\d+)", image_verse_block)
+    if id_match:
+        chapter, verse = int(id_match.group(1)), int(id_match.group(2))
+        if (chapter, verse) != (expected_chapter, expected_verse):
+            print(
+                f"  WARNING: {md_path.name} 'verse for the image' is "
+                f"^{chapter}-{verse}, expected ^{expected_chapter}-{expected_verse}"
+            )
 
-        verse = _extract_verse(section)
-        practice, explanation = _extract_english(section)
-
-        entries.append(VerseEntry(
-            number=num,
-            verse=verse,
-            practice=practice,
-            explanation=explanation,
-        ))
-
-    return entries
+    return practice_bo, explanation_bo
 
 
-def _extract_verse(section: str) -> str:
-    """Extract the Tibetan verse lines (before the first **Tibetan** marker)."""
-    match = re.search(r"^(.+?)(?=\*\*Tibetan)", section, re.DOTALL)
-    return match.group(1).strip() if match else ""
+def parse_english_day_plan(md_path: Path) -> tuple[str, str]:
+    """Extract the English practice + explanation for today from a day-plan file."""
+    text = md_path.read_text(encoding="utf-8")
+
+    section = _extract_heading_block(text, "3) Today's Practice", level="##")
+    if not section:
+        raise ValueError(f"{md_path.name}: could not find the \"Today's Practice\" section")
+
+    practice_en = _extract_bold_field(section, "Actual Practice")
+    explanation_en = _extract_bold_field(section, "Explanation")
+
+    if not practice_en or not explanation_en:
+        raise ValueError(f"{md_path.name}: could not parse English practice/explanation")
+
+    return practice_en, explanation_en
 
 
-def _extract_english(section: str) -> tuple[str, str]:
-    """Extract English Practice/Action and Explanation from a section."""
-    eng_match = re.search(
-        r"\*\*English[:\s]*\*\*[:\s]*\n(.+?)(?=\*\*Hindi|\n---|\Z)",
-        section,
-        re.DOTALL,
+def load_day_challenge(day_verse: DayVerse) -> DayChallenge:
+    """Locate and parse the Tibetan + English day-plan files for one verse."""
+    tibetan_path = find_tibetan_day_plan(day_verse.day, day_verse.chapter)
+    practice_bo, explanation_bo = parse_tibetan_day_plan(
+        tibetan_path, day_verse.chapter, day_verse.verse
     )
-    if not eng_match:
-        return "", ""
 
-    eng_block = eng_match.group(1).strip()
+    english_path = find_english_day_plan(day_verse.day, day_verse.chapter)
+    practice_en, explanation_en = parse_english_day_plan(english_path)
 
-    practice_match = re.search(
-        r"\*\*(?:Practice|Action)\*\*[:\s]*(.+?)(?=\*\*Explanation|\Z)",
-        eng_block,
-        re.DOTALL,
+    return DayChallenge(
+        practice_bo=practice_bo,
+        explanation_bo=explanation_bo,
+        practice_en=practice_en,
+        explanation_en=explanation_en,
     )
-    practice = practice_match.group(1).strip() if practice_match else ""
-
-    explanation_match = re.search(
-        r"\*\*Explanation\*\*[:\s]*(.+?)$",
-        eng_block,
-        re.DOTALL,
-    )
-    explanation = explanation_match.group(1).strip() if explanation_match else ""
-
-    return practice, explanation
 
 
-def is_processed(verse_dir: Path) -> bool:
-    """A verse is processed if illustration_1.png already exists."""
-    return (verse_dir / "illustration_1.png").exists()
+def is_processed(output_path: Path) -> bool:
+    """A day is processed if its illustration file already exists."""
+    return output_path.exists()
 
 
 def make_background_transparent(
@@ -246,22 +346,18 @@ def _make_request(prompt: str) -> dict:
     }
 
 
-def build_requests_for_verse(entry: VerseEntry) -> list[dict]:
-    """Build three batch requests per verse: verse-only, practice-only, combined."""
-    verse_prompt = VERSE_PROMPT_TEMPLATE.format(verse=entry.verse)
-    practice_prompt = PRACTICE_PROMPT_TEMPLATE.format(
-        practice=entry.practice,
+def build_request_for_day(day_verse: DayVerse, challenge: DayChallenge) -> dict:
+    """Build the single combined batch request for one day's verse + challenge."""
+    prompt = COMBINED_PROMPT_TEMPLATE.format(
+        verse_bo=day_verse.verse_bo,
+        verse_en=day_verse.verse_en,
+        verse_hi=day_verse.verse_hi,
+        practice_bo=challenge.practice_bo,
+        explanation_bo=challenge.explanation_bo,
+        practice_en=challenge.practice_en,
+        explanation_en=challenge.explanation_en,
     )
-    combined_prompt = COMBINED_PROMPT_TEMPLATE.format(
-        verse=entry.verse,
-        practice=entry.practice,
-        explanation=entry.explanation,
-    )
-    return [
-        _make_request(verse_prompt),
-        _make_request(practice_prompt),
-        _make_request(combined_prompt),
-    ]
+    return _make_request(prompt)
 
 
 def submit_batch(client: genai.Client, requests: list[dict]) -> str:
@@ -288,57 +384,51 @@ def poll_until_done(client: genai.Client, job_name: str):
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
-_PROMPT_LABELS = {0: "verse", 1: "practice", 2: "combined"}
+def save_images(batch_job, output_paths: list[Path]) -> None:
+    """Extract images from batch responses and save one per day.
 
-
-def save_images(batch_job, verse_dirs: list[Path]) -> None:
-    """Extract images from batch responses and save to verse folders.
-
-    Responses are ordered as IMAGES_PER_VERSE consecutive entries per verse:
-    index 0 → verse, index 1 → practice, index 2 → combined.
+    Responses are ordered 1:1 with ``output_paths``.
     """
     responses = batch_job.dest.inlined_responses
 
-    for resp_idx, inline_response in enumerate(responses):
-        verse_idx = resp_idx // IMAGES_PER_VERSE
-        prompt_idx = resp_idx % IMAGES_PER_VERSE
-        img_num = prompt_idx + 1
-        label = _PROMPT_LABELS.get(prompt_idx, str(img_num))
-
-        if verse_idx >= len(verse_dirs):
-            break
-
-        verse_dir = verse_dirs[verse_idx]
-
+    for output_path, inline_response in zip(output_paths, responses):
         if inline_response.error:
-            print(f"  ERROR for {verse_dir.name} ({label}): {inline_response.error}")
+            print(f"  ERROR for {output_path.name}: {inline_response.error}")
             continue
 
         if not inline_response.response:
-            print(f"  No response for {verse_dir.name} ({label})")
+            print(f"  No response for {output_path.name}")
             continue
 
         for part in inline_response.response.candidates[0].content.parts:
             if part.inline_data:
-                image = part.as_image()
-                output_path = verse_dir / f"illustration_{img_num}.png"
-                image.save(str(output_path))
+                # part.as_image() returns a genai Image (raw bytes wrapper),
+                # not a PIL Image — decode it before using PIL-based helpers.
+                pil_image = Image.open(io.BytesIO(part.as_image().image_bytes))
+                save_png_under_limit(pil_image, output_path)
                 make_background_transparent(output_path)
-                print(f"  Saved: {output_path} ({label})")
+                print(f"  Saved: {output_path}")
             elif part.text:
-                text_path = verse_dir / "illustration_notes.txt"
+                text_path = output_path.with_suffix(".notes.txt")
                 with text_path.open("a", encoding="utf-8") as f:
-                    f.write(f"--- {label} ---\n{part.text}\n\n")
+                    f.write(f"{part.text}\n\n")
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: python generate_illustrations.py <path/to/v2.md>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Generate daily Bodhisattva Challenge illustrations via Gemini."
+    )
+    parser.add_argument("sharable_images_dir", help="Path to the Sharable-Images folder")
+    parser.add_argument(
+        "--day", type=int, default=None,
+        help="Only generate the illustration for this day number (default: all unprocessed days)",
+    )
+    parsed = parser.parse_args()
+    day_filter = parsed.day
 
-    md_path = Path(sys.argv[1]).resolve()
-    if not md_path.is_file():
-        print(f"Error: {md_path} is not a file")
+    sharable_dir = Path(parsed.sharable_images_dir).resolve()
+    if not sharable_dir.is_dir():
+        print(f"Error: {sharable_dir} is not a directory")
         sys.exit(1)
 
     api_key = os.environ.get("GEMINI_KEY")
@@ -348,30 +438,54 @@ def main() -> None:
 
     client = genai.Client(api_key=api_key)
 
-    entries = parse_verses(md_path)
-    print(f"Parsed {len(entries)} verses from {md_path.name}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    output_dir = md_path.parent
-    unprocessed_dirs: list[Path] = []
+    md_files = sorted(
+        sharable_dir.glob("day_*_sharable_image_text.md"),
+        key=parse_day_number,
+    )
+    if not md_files:
+        print(f"No day_*_sharable_image_text.md files found in {sharable_dir}")
+        sys.exit(1)
+
+    if day_filter is not None:
+        md_files = [p for p in md_files if parse_day_number(p) == day_filter]
+        if not md_files:
+            print(f"No day file found for day {day_filter} in {sharable_dir}")
+            sys.exit(1)
+
+    print(f"Found {len(md_files)} day file(s) in {sharable_dir.name}")
+
     requests: list[dict] = []
+    output_paths: list[Path] = []
 
-    for entry in entries:
-        verse_dir = output_dir / f"verse_{entry.number}"
-        verse_dir.mkdir(exist_ok=True)
-
-        if is_processed(verse_dir):
-            print(f"  Skipping verse {entry.number} (already has illustrations)")
+    for md_path in md_files:
+        try:
+            day_verse = parse_sharable_image_md(md_path)
+        except ValueError as exc:
+            print(f"  Skipping {md_path.name}: {exc}")
             continue
 
-        print(f"  Verse {entry.number}: practice='{entry.practice[:60]}...'")
-        unprocessed_dirs.append(verse_dir)
-        requests.extend(build_requests_for_verse(entry))
+        output_path = OUTPUT_DIR / f"Day{day_verse.day}-ch{day_verse.chapter}.png"
+        if is_processed(output_path):
+            print(f"  Skipping day {day_verse.day} (already has an illustration)")
+            continue
+
+        try:
+            challenge = load_day_challenge(day_verse)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"  Skipping day {day_verse.day}: {exc}")
+            continue
+
+        print(f"  Day {day_verse.day} (ch{day_verse.chapter}, v{day_verse.verse}): queued")
+        requests.append(build_request_for_day(day_verse, challenge))
+        output_paths.append(output_path)
 
     if not requests:
-        print("All verses already processed. Nothing to do.")
+        print("Nothing to do.")
         return
 
-    print(f"\nSubmitting batch: {len(unprocessed_dirs)} verses, {len(requests)} requests...")
+    print(f"\nSubmitting batch: {len(output_paths)} day(s)...")
     job_name = submit_batch(client, requests)
 
     print("Polling for completion...")
@@ -380,7 +494,7 @@ def main() -> None:
     state = batch_job.state.name if hasattr(batch_job.state, "name") else str(batch_job.state)
     if state == "JOB_STATE_SUCCEEDED":
         print("\nBatch succeeded! Saving images...")
-        save_images(batch_job, unprocessed_dirs)
+        save_images(batch_job, output_paths)
         print("\nDone.")
     else:
         print(f"\nBatch job ended with state: {state}")

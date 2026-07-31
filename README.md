@@ -35,11 +35,14 @@ This project automates production of the daily **Bodhisattva Challenge** posts
 for [@WeBuddhist](https://twitter.com/WeBuddhist). It has three stages, each a
 standalone CLI script under `src/illustration_generator/`:
 
-1. **`generate_illustrations.py`** — Parses a `Verse_and_challenge.md` file
-   (verses in Tibetan with English practice/explanation), submits a batch job
-   to Gemini 3 Pro Image to generate three line-art illustrations per verse
-   (verse-only, practice-only, combined), and saves them per-verse with
-   transparent backgrounds.
+1. **`generate_illustrations.py`** — Parses a folder of
+   `day_NN_sharable_image_text.md` files (verse of the day in English,
+   Tibetan, and Hindi), matches each day to its Tibetan and English day-plan
+   files to pull in the daily "challenge" (practice + explanation), and
+   submits a batch job to Gemini 3 Pro Image to generate **one** combined
+   line-art illustration per day (Tibetan verse as the primary text, other
+   languages as context), saving each with a transparent background as
+   `data/illustrations/Day<N>-ch<C>.png`.
 2. **`compose_challenge_post.py`** — Composes a single-language (English)
    daily "challenge" post: title, bold practice, illustration, left-aligned
    verse with right-aligned verse id citation, and the `@WeBuddhist` handle,
@@ -87,15 +90,27 @@ Export your Gemini API key (only required for `generate_illustrations.py`):
 export GEMINI_KEY="your-api-key-here"
 ```
 
+`generate_illustrations.py` also reads the daily "challenge" (practice +
+explanation) from two vault folders outside this repo. Defaults point at the
+`bodhisattvacharyavatara-rails` Obsidian vault; override with environment
+variables if your checkout lives elsewhere:
+```bash
+export DALAI_LAMA_PLANS_DIR="/path/to/bodhisattvacharyavatara-rails/3-TRANSFORMATIONS/Plans/Dalai Lama"
+export EN_CHALLENGE_DAYS_DIR="/path/to/bodhisattvacharyavatara-rails/3-TRANSFORMATIONS/Plans/the-bodhisattva-challenge/en/Days"
+```
+
 ### Run
 
-**1. Generate illustrations from a verse markdown file:**
+**1. Generate illustrations from a Sharable-Images folder:**
 ```bash
-python -m illustration_generator.generate_illustrations path/to/Verse_and_challenge.md
+python -m illustration_generator.generate_illustrations path/to/Sharable-Images
 ```
-Creates one `verse_<N>/` folder per verse next to the markdown file, each with
-`illustration_1.png` (verse), `illustration_2.png` (practice), and
-`illustration_3.png` (combined), all with transparent backgrounds.
+Processes every `day_NN_sharable_image_text.md` file in the folder. For each
+day it: reads the verse of the day (English/Tibetan/Hindi), locates the
+matching Tibetan and English day-plan files by day + chapter number to pull
+in that day's practice + explanation, and generates one combined illustration
+per day, saved to `data/illustrations/Day<N>-ch<C>.png` with a transparent
+background. Days whose output file already exists are skipped.
 
 **2. Compose a single-language challenge post:**
 ```bash
