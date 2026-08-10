@@ -38,15 +38,22 @@ EN_CHALLENGE_DAYS_DIR = Path(os.environ.get(
 
 OUTPUT_DIR = Path(__file__).parent / "data" / "illustrations"
 
+# Raw illustrations are line-art source assets, not the final social-media
+# post, so they don't need the strict ~1MB limit used for composed posts.
+# Keep a generous cap just to avoid pathological file sizes.
+RAW_ILLUSTRATION_MAX_BYTES = 8_000_000  # 8 MB
+
 _STYLE_BLOCK = """\
-The line drawing illustration should be a Anand Pai comic illustration combined with features of "Madhubani art style".
-The drawing is done exclusively as a heavy blue line drawing in monochrome blue line. \
-The scene happens in a rural Indian village scene in Buddhist Bihar. \
-The scene can show the buddha and bodhisattvas when relevant. \
-The scene should be a single scene, with a clear action happening in the scene. \
-The composition of the scene should be like a comic panel without text bubbles. \
-Comic book spot illustration, plain white background. \
-The drawing has no borders and is not busy."""
+Create a mature, sophisticated Indian folk-art illustration inspired by the intricate visual language of Madhubani painting and finely observed editorial line art. \
+Do not imitate a children's book, cartoon, comic strip, animation, caricature, or mascot style. \
+Use natural human proportions, believable anatomy, age-appropriate faces, subtle expressions, and an observational sense of gesture and movement. \
+The drawing is exclusively a refined monochrome deep-blue pen line on a plain white or transparent background, with varied line weight, delicate hatching, and carefully controlled detail. \
+Use intricate Madhubani-inspired botanical, textile, and architectural patterns selectively as surface detail, not as noisy decoration. \
+The scene happens in a rural Indian village in Buddhist Bihar. \
+The scene can show the Buddha and bodhisattvas when relevant. \
+The composition is one calm, well-observed narrative scene with a clear action and an editorial, museum-quality finish. \
+Let the line-art scene float freely with generous breathing room. \
+Never draw an outer frame, rectangular boundary, panel outline, mat, picture border, or decorative enclosing line."""
 
 _RULES_BLOCK = """\
 STRICT RULES — follow all of them without exception:
@@ -60,8 +67,16 @@ STRICT RULES — follow all of them without exception:
 village life.
 - The illustration should make people smile or gasp.
 - The image has one single clear scene, with a clear action happening in the scene.
-- The illustration shouldn't be in a square box. The image panel shouldn't have side borders.
+- ABSOLUTELY NO BORDER: do not draw any line enclosing the artwork on any side. \
+No rectangular frame, square box, comic-panel outline, edge rule, border, or decorative perimeter. \
+The outermost visible marks must be part of the scene itself, never a continuous line around it.
+- Keep the artwork floating on the background; do not make it look like a framed print or tile.
 """
+
+_DAY_VISUAL_BRIEFS = {
+    31: """For this day, depict one unmistakable moment at a rural village market: a seller is about to make a quick sale, but openly points out a clearly visible crack or defect in a clay pot instead of hiding it. The buyer looks directly at the disclosed defect and understands the truthful warning; the seller's gesture shows that honesty matters more than the small profit. This exact act of truthful disclosure is the central subject. Do not depict a generic market or a merely pleasant exchange.""",
+}
+
 
 COMBINED_PROMPT_TEMPLATE = f"""\
 Let's illustrate a scene for a buddhist text.
@@ -86,9 +101,16 @@ Tibetan explanation: {{explanation_bo}}
 English practice: {{practice_en}}
 English explanation: {{explanation_en}}
 
-Pick a common theme uniting the verse and the practice above. \
-Identify the main character(s) of the scene, and the action happening in the scene. \
-The illustration should trigger the main feeling of the theme.
+IMPORTANT VISUAL PRIORITY — TODAY'S PRACTICE:
+The English practice is the primary subject of the illustration, not merely background context. \
+The English explanation is equally important visual guidance: use its concrete examples, motive, consequence, and emotional logic to choose the scene. \
+Do not treat the explanation as background reading or replace its specific situation with a generic symbol of honesty. \
+Translate the practice and explanation together into one literal, observable human action that could be understood without any text. \
+Show the moment of choice and its consequence clearly through body language, gesture, and the objects in the scene. \
+Do not make a generic village scene, a generic market scene, or an image that illustrates only an abstract mood. \
+Do not illustrate only the verse while ignoring the practice and explanation. \
+{{visual_brief}}
+Use the verse's themes only to deepen the scene's meaning after the concrete practice and explanation have been established.
 
 {_STYLE_BLOCK}
 """
@@ -356,6 +378,10 @@ def build_request_for_day(day_verse: DayVerse, challenge: DayChallenge) -> dict:
         explanation_bo=challenge.explanation_bo,
         practice_en=challenge.practice_en,
         explanation_en=challenge.explanation_en,
+        visual_brief=_DAY_VISUAL_BRIEFS.get(
+            day_verse.day,
+            "Create one concrete, observable scene that directly enacts the English practice above."
+        ),
     )
     return _make_request(prompt)
 
@@ -405,7 +431,14 @@ def save_images(batch_job, output_paths: list[Path]) -> None:
                 # part.as_image() returns a genai Image (raw bytes wrapper),
                 # not a PIL Image — decode it before using PIL-based helpers.
                 pil_image = Image.open(io.BytesIO(part.as_image().image_bytes))
-                save_png_under_limit(pil_image, output_path)
+                # Raw illustrations are intermediate line-art assets, not the
+                # final social-media post — the 1MB default in
+                # save_png_under_limit forces 256-color palette quantization,
+                # which visibly pixelates the anti-aliased line edges. Use a
+                # much larger cap so full-quality PNG is kept whenever
+                # possible; downstream composition steps apply their own
+                # (appropriately strict) size limit to the final post.
+                save_png_under_limit(pil_image, output_path, max_bytes=RAW_ILLUSTRATION_MAX_BYTES)
                 make_background_transparent(output_path)
                 print(f"  Saved: {output_path}")
             elif part.text:
@@ -422,6 +455,10 @@ def main() -> None:
     parser.add_argument(
         "--day", type=int, default=None,
         help="Only generate the illustration for this day number (default: all unprocessed days)",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Regenerate illustrations even when output files already exist",
     )
     parsed = parser.parse_args()
     day_filter = parsed.day
@@ -467,7 +504,7 @@ def main() -> None:
             continue
 
         output_path = OUTPUT_DIR / f"Day{day_verse.day}-ch{day_verse.chapter}.png"
-        if is_processed(output_path):
+        if is_processed(output_path) and not parsed.force:
             print(f"  Skipping day {day_verse.day} (already has an illustration)")
             continue
 
