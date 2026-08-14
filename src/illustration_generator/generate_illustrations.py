@@ -228,6 +228,20 @@ def _extract_heading_block(text: str, needle: str, level: str = "###") -> str:
     return match.group(1) if match else ""
 
 
+def _extract_heading_block_any_level(text: str, needle: str, levels: tuple[str, ...]) -> str:
+    """Try ``_extract_heading_block`` at each heading level in turn.
+
+    The day-plan files are hand-authored and the heading level used for a
+    given section (e.g. "today's practice") has varied over time (``#``,
+    ``###``, ...), so probe several levels instead of assuming a fixed one.
+    """
+    for level in levels:
+        block = _extract_heading_block(text, needle, level=level)
+        if block:
+            return block
+    return ""
+
+
 def find_tibetan_day_plan(day: int, chapter: int) -> Path:
     """Locate the Tibetan (Dalai Lama) day-plan file for ``day``/``chapter``."""
     chapter_dir = _find_chapter_dir(DALAI_LAMA_PLANS_DIR, chapter)
@@ -249,11 +263,11 @@ def find_english_day_plan(day: int, chapter: int) -> Path:
 
 
 def _extract_field(text: str, needle: str) -> str:
-    """Extract a field that may appear either as a ``#### needle`` heading or
-    as an inline ``**needle**`` bold marker (both conventions occur in the
-    Tibetan day-plan files).
+    """Extract a field that may appear either as a heading (``##``/``###``/``####``)
+    or as an inline ``**needle**`` bold marker (all conventions occur across
+    the Tibetan day-plan files).
     """
-    heading_value = _extract_heading_block(text, needle, level="####").strip()
+    heading_value = _extract_heading_block_any_level(text, needle, levels=("##", "###", "####")).strip()
     if heading_value:
         return heading_value
     return _extract_bold_field(text, needle)
@@ -263,7 +277,7 @@ def parse_tibetan_day_plan(md_path: Path, expected_chapter: int, expected_verse:
     """Extract the Tibetan practice + explanation for today from a day-plan file."""
     text = md_path.read_text(encoding="utf-8")
 
-    section = _extract_heading_block(text, "དེ་རིང་གི་ཉམས་ལེན")
+    section = _extract_heading_block_any_level(text, "དེ་རིང་གི་ཉམས་ལེན", levels=("#", "##", "###"))
     if not section:
         raise ValueError(f"{md_path.name}: could not find the 'today's practice' section")
 
